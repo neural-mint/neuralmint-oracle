@@ -1,0 +1,8 @@
+{
+  "name": "neuralmint-oracle",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "ethers": "^6.7.0"
+  }
+}
