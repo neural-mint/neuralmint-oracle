@@ -2,15 +2,7 @@
   "crons": [
     {
       "path": "/api/push",
-      "schedule": "0 */4 * * *"
+      "schedule": "0 0 * * *"
     }
-  ],
-  "functions": {
-    "api/push.js": {
-      "maxDuration": 60
-    },
-    "api/signal.js": {
-      "maxDuration": 15
-    }
-  }
+  ]
 }
