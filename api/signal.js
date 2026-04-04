@@ -1,195 +1,172 @@
-// api/push.js
+// api/signal.js
 // ─────────────────────────────────────────────────────────────────────────────
-// NeuralMint Auto-Pusher — Vercel Cron Job (runs every 4 hours)
+// NeuralMint AI Oracle — Vercel Serverless Function
 //
-// What this does:
-//   1. Fetches live BTC signal from /api/signal (your AI oracle function)
-//   2. Calls pushSignal() on your AIOracle smart contract
-//   3. Posts the result to the Polygon blockchain automatically
+// Reads TWO free data sources (no API keys needed):
+//   1. CoinGecko  → Bitcoin price + 24h % change
+//   2. Alternative.me → Bitcoin Fear & Greed Index (0-100)
 //
-// Required environment variables in Vercel dashboard:
-//   PRIVATE_KEY      → your wallet private key (the one you deployed with)
-//   ORACLE_ADDRESS   → your AIOracle contract address
-//   RPC_URL          → Polygon RPC (we use a free Alchemy one)
-//   CRON_SECRET      → any random string you choose (prevents abuse)
+// FIX: Binance public API is used as a fallback for BTC price if CoinGecko
+// fails, instead of falling back to a stale hardcoded value.
 // ─────────────────────────────────────────────────────────────────────────────
-
-import { ethers } from "ethers";
-
-// ── AIOracle ABI — only the function we need ──────────────────────────────────
-const ORACLE_ABI = [
-  "function pushSignal(uint256 _burnRateBps, uint256 _apyMultiplier, uint256 _mintCapMillions, uint256 _btcPriceCents, int256 _btcChangeBps, uint256 _fearGreed, string calldata _mood) external",
-  "function lastUpdated() view returns (uint256)",
-  "function updateInterval() view returns (uint256)",
-  "function authorizedCallers(address) view returns (bool)",
-];
 
 export default async function handler(req, res) {
-
-  // ── Security: only allow Vercel cron or requests with secret ─────────────
-  const authHeader = req.headers["authorization"];
-  const cronHeader = req.headers["x-vercel-cron"]; // set automatically by Vercel cron
-  const secret     = process.env.CRON_SECRET;
-
-  const isVercelCron    = cronHeader === "1";
-  const hasValidSecret  = secret && authHeader === `Bearer ${secret}`;
-
-  if (!isVercelCron && !hasValidSecret) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-
-  // ── Check required env vars ───────────────────────────────────────────────
-  const { PRIVATE_KEY, ORACLE_ADDRESS, RPC_URL } = process.env;
-  if (!PRIVATE_KEY || !ORACLE_ADDRESS || !RPC_URL) {
-    return res.status(500).json({
-      error: "Missing env vars",
-      missing: [
-        !PRIVATE_KEY    && "PRIVATE_KEY",
-        !ORACLE_ADDRESS && "ORACLE_ADDRESS",
-        !RPC_URL        && "RPC_URL",
-      ].filter(Boolean),
-    });
-  }
-
-  const startTime = Date.now();
-  const log = [];
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Cache-Control", "no-store");
+  if (req.method === "OPTIONS") return res.status(200).end();
 
   try {
+    // ── 1. Fetch Bitcoin price — CoinGecko primary, Binance fallback ──────────
+    let btcPrice = null, btcChange = null, priceSource = "CoinGecko";
 
-    // ── Step 1: Fetch the AI signal from our own /api/signal ─────────────────
-    log.push("Fetching AI signal...");
-
-    const baseUrl = process.env.VERCEL_URL
-      ? `https://${process.env.VERCEL_URL}`
-      : "http://localhost:3000";
-
-    const signalRes = await fetch(`${baseUrl}/api/signal`, {
-      signal: AbortSignal.timeout(10000),
-    });
-
-    if (!signalRes.ok) {
-      throw new Error(`Signal fetch failed: ${signalRes.status}`);
-    }
-
-    const signalData = await signalRes.json();
-    const { onChain, display } = signalData;
-
-    log.push(`Signal fetched: BTC ${display.btcPrice} | F&G ${display.fearGreedIndex} | Mood: ${display.mood}`);
-    log.push(`Parameters: burn=${display.burnRate} apy=${display.apyMultiplier} cap=${display.mintCap}`);
-
-    // ── Step 2: Connect to Polygon via ethers.js ──────────────────────────────
-    log.push("Connecting to Polygon...");
-
-    const provider = new ethers.JsonRpcProvider(RPC_URL);
-    const wallet   = new ethers.Wallet(PRIVATE_KEY, provider);
-    const oracle   = new ethers.Contract(ORACLE_ADDRESS, ORACLE_ABI, wallet);
-
-    // Check wallet balance
-    const balance = await provider.getBalance(wallet.address);
-    const balancePOL = parseFloat(ethers.formatEther(balance)).toFixed(4);
-    log.push(`Wallet: ${wallet.address} | Balance: ${balancePOL} POL`);
-
-    if (balance < ethers.parseEther("0.001")) {
-      throw new Error(`Wallet balance too low: ${balancePOL} POL. Need at least 0.001 POL for gas.`);
-    }
-
-    // ── Step 3: Check if oracle update interval has passed ───────────────────
-    const [lastUpdated, updateInterval] = await Promise.all([
-      oracle.lastUpdated(),
-      oracle.updateInterval(),
-    ]);
-
-    const now            = BigInt(Math.floor(Date.now() / 1000));
-    const nextUpdateTime = lastUpdated + updateInterval;
-    const secondsUntil   = nextUpdateTime > now ? Number(nextUpdateTime - now) : 0;
-
-    if (secondsUntil > 0) {
-      const minutesUntil = Math.ceil(secondsUntil / 60);
-      log.push(`Oracle not ready yet. Next update in ${minutesUntil} minutes.`);
-      return res.status(200).json({
-        status:  "skipped",
-        reason:  `Update interval not elapsed. Next update in ${minutesUntil} minutes.`,
-        nextUpdateAt: new Date(Number(nextUpdateTime) * 1000).toISOString(),
-        log,
-        duration: Date.now() - startTime + "ms",
-      });
-    }
-
-    log.push("Oracle ready for update. Pushing signal on-chain...");
-
-    // ── Step 4: Estimate gas and push the signal ──────────────────────────────
-    const gasPrice = await provider.getFeeData();
-
-    // Use 35 Gwei priority fee minimum to avoid the "gas too low" error
-    const maxPriorityFee = gasPrice.maxPriorityFeePerGas > ethers.parseUnits("35", "gwei")
-      ? gasPrice.maxPriorityFeePerGas
-      : ethers.parseUnits("35", "gwei");
-
-    const maxFee = gasPrice.maxFeePerGas > ethers.parseUnits("40", "gwei")
-      ? gasPrice.maxFeePerGas
-      : ethers.parseUnits("40", "gwei");
-
-    const tx = await oracle.pushSignal(
-      onChain.burnRateBps,
-      onChain.apyMultiplier,
-      onChain.mintCapMillions,
-      onChain.btcPriceCents,
-      onChain.btcChangeBps,
-      onChain.fearGreed,
-      onChain.mood,
-      {
-        maxPriorityFeePerGas: maxPriorityFee,
-        maxFeePerGas:         maxFee,
-        gasLimit:             300_000,   // safe upper bound
+    try {
+      const priceRes = await fetch(
+        "https://api.coingecko.com/api/v3/simple/price" +
+        "?ids=bitcoin&vs_currencies=usd&include_24hr_change=true",
+        { headers: { "Accept": "application/json" }, signal: AbortSignal.timeout(8000) }
+      );
+      if (priceRes.ok) {
+        const priceData = await priceRes.json();
+        const btc = priceData?.bitcoin;
+        if (btc?.usd) {
+          btcPrice  = btc.usd;
+          btcChange = btc.usd_24h_change ?? 0;
+        }
       }
-    );
+    } catch (_) { /* try fallback */ }
 
-    log.push(`Transaction sent: ${tx.hash}`);
-    log.push(`Waiting for confirmation on Polygon...`);
+    // FIX: Binance public ticker — no API key, extremely reliable
+    if (btcPrice === null) {
+      try {
+        priceSource = "Binance";
+        const [tickerRes, statsRes] = await Promise.all([
+          fetch("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
+                { signal: AbortSignal.timeout(6000) }),
+          fetch("https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT",
+                { signal: AbortSignal.timeout(6000) }),
+        ]);
+        if (tickerRes.ok && statsRes.ok) {
+          const ticker = await tickerRes.json();
+          const stats  = await statsRes.json();
+          btcPrice  = parseFloat(ticker.price);
+          // priceChangePercent is already a percentage string like "-2.53"
+          btcChange = parseFloat(stats.priceChangePercent ?? "0");
+        }
+      } catch (_) { /* both sources failed */ }
+    }
 
-    // ── Step 5: Wait for 1 confirmation ──────────────────────────────────────
-    const receipt = await tx.wait(1);
-    const gasUsed  = receipt.gasUsed.toString();
-    const gasCost  = parseFloat(ethers.formatEther(receipt.gasUsed * maxFee)).toFixed(6);
+    // If both APIs failed, throw so we return a clean error — not a stale push
+    if (btcPrice === null) {
+      throw new Error("All BTC price sources unavailable");
+    }
 
-    log.push(`Confirmed in block ${receipt.blockNumber}`);
-    log.push(`Gas used: ${gasUsed} units (~${gasCost} POL)`);
+    // ── 2. Fetch Fear & Greed Index from Alternative.me (free, no key) ────────
+    let fearGreed = 50, fgLabel = "Neutral";
 
-    // ── Step 6: Return success ────────────────────────────────────────────────
+    try {
+      const fgRes = await fetch(
+        "https://api.alternative.me/fng/?limit=1&format=json",
+        { headers: { "Accept": "application/json" }, signal: AbortSignal.timeout(8000) }
+      );
+      if (fgRes.ok) {
+        const fgData = await fgRes.json();
+        const latest = fgData?.data?.[0];
+        fearGreed = parseInt(latest?.value ?? "50", 10);
+        fgLabel   = latest?.value_classification ?? "Neutral";
+      }
+    } catch (_) { /* use neutral default */ }
+
+    // ── 3. AI Signal Logic ────────────────────────────────────────────────────
+    const absChange = Math.abs(btcChange);
+
+    const volatilityScore = Math.min(100, absChange * 4);
+    const fearScore       = 100 - fearGreed;
+    const stressScore     = (volatilityScore * 0.5) + (fearScore * 0.5);
+
+    let burnRateBps, apyMultiplier, mintCapMillions, mood;
+
+    if (stressScore >= 75) {
+      burnRateBps     = 450;
+      apyMultiplier   = 400;
+      mintCapMillions = 3;
+      mood            = fearGreed < 25 ? "Extreme Fear" : "High Fear";
+    } else if (stressScore >= 55) {
+      burnRateBps     = 300;
+      apyMultiplier   = 250;
+      mintCapMillions = 7;
+      mood            = "Fear";
+    } else if (stressScore >= 35) {
+      burnRateBps     = 150;
+      apyMultiplier   = 150;
+      mintCapMillions = 15;
+      mood            = "Neutral";
+    } else if (stressScore >= 15) {
+      burnRateBps     = 75;
+      apyMultiplier   = 100;
+      mintCapMillions = 25;
+      mood            = "Greed";
+    } else {
+      burnRateBps     = 25;
+      apyMultiplier   = 70;
+      mintCapMillions = 40;
+      mood            = "Extreme Greed";
+    }
+
+    if (btcChange > 10)  mood = "Extreme Greed";
+    if (btcChange < -10) mood = "Extreme Fear";
+
+    burnRateBps     = Math.max(0,  Math.min(500,  Math.round(burnRateBps)));
+    apyMultiplier   = Math.max(50, Math.min(1000, Math.round(apyMultiplier)));
+    mintCapMillions = Math.max(1,  Math.min(100,  Math.round(mintCapMillions)));
+
+    const btcPriceCents = Math.round(btcPrice * 100);
+    const btcChangeBps  = Math.round(btcChange * 100);
+
+    // ── 4. Response ───────────────────────────────────────────────────────────
     return res.status(200).json({
-      status:  "success",
-      txHash:  tx.hash,
-      txUrl:   `https://polygonscan.com/tx/${tx.hash}`,
-      block:   receipt.blockNumber,
-      signal:  display,
-      gasUsed,
-      gasCostPOL: gasCost,
-      log,
-      duration: Date.now() - startTime + "ms",
+      onChain: {
+        burnRateBps,
+        apyMultiplier,
+        mintCapMillions,
+        btcPriceCents,
+        btcChangeBps,
+        fearGreed,
+        mood,
+      },
+      display: {
+        btcPrice:       `$${btcPrice.toLocaleString("en-US", { maximumFractionDigits: 0 })}`,
+        btcChange24h:   `${btcChange >= 0 ? "+" : ""}${btcChange.toFixed(2)}%`,
+        fearGreedIndex: fearGreed,
+        fearGreedLabel: fgLabel,
+        mood,
+        burnRate:       `${(burnRateBps / 100).toFixed(2)}%`,
+        apyMultiplier:  `${(apyMultiplier / 100).toFixed(1)}×`,
+        mintCap:        `${mintCapMillions}M NMNT`,
+        stressScore:    Math.round(stressScore),
+      },
+      meta: {
+        computedAt:  new Date().toISOString(),
+        priceSource,
+        sources:     [`${priceSource} (BTC price)`, "Alternative.me (Fear & Greed)"],
+        version:     "2.1.0-btc",
+        fallback:    false,
+      }
     });
 
   } catch (err) {
-    log.push(`ERROR: ${err.message}`);
-
-    // Common error hints
-    let hint = "";
-    if (err.message.includes("gas"))
-      hint = "Gas issue — the contract may already be updated, or gas settings need increasing.";
-    else if (err.message.includes("Too soon") || err.message.includes("interval"))
-      hint = "Update interval not elapsed yet — Gelato/cron triggered too early.";
-    else if (err.message.includes("Not authorized"))
-      hint = "Your wallet address is not in authorizedCallers. Call setAuthorizedCaller(yourAddress, true) on AIOracle from Remix.";
-    else if (err.message.includes("nonce"))
-      hint = "Nonce issue — a previous transaction is still pending. Wait a minute and retry.";
-    else if (err.message.includes("insufficient funds"))
-      hint = "Not enough POL for gas. Top up your pusher wallet with at least 0.1 POL.";
-
-    return res.status(500).json({
-      status:   "error",
-      error:    err.message,
-      hint,
-      log,
-      duration: Date.now() - startTime + "ms",
+    // FIX: Return an error response — do NOT return fake neutral parameters.
+    // The push.js caller checks for status "error" and skips the on-chain push,
+    // so a bad API day won't push a stale signal to the blockchain.
+    return res.status(503).json({
+      status: "error",
+      error:  err.message,
+      meta: {
+        computedAt: new Date().toISOString(),
+        fallback:   true,
+        sources:    [],
+        version:    "2.1.0-btc",
+      }
     });
   }
 }
