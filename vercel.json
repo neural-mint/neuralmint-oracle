@@ -1,0 +1,10 @@
+{
+  "functions": {
+    "api/push.js": {
+      "maxDuration": 60
+    },
+    "api/signal.js": {
+      "maxDuration": 15
+    }
+  }
+}
